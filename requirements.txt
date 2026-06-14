@@ -1,0 +1,6 @@
+PyQt6
+Pillow
+imageio[ffmpeg]
+requests
+pathvalidate
+pyinstaller
