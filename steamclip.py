@@ -24,7 +24,7 @@ from pathlib import Path
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QGridLayout,
-    QFrame, QComboBox, QDialog, QTableWidget,
+    QFrame, QComboBox, QLineEdit, QDialog, QTableWidget,
     QTableWidgetItem, QTextEdit, QMessageBox,
     QFileDialog, QLayout, QProgressBar, QHeaderView,
     QGroupBox
@@ -347,6 +347,8 @@ class SteamClipApp(QWidget):
         self.clip_index = 0
         self.clip_folders = []
         self.original_clip_folders = []
+        self._duration_cache = {}
+        self._size_cache = {}
         self.game_ids = {}
         self._custom_record_cache = {}
         self.config = self.load_config()
@@ -386,6 +388,24 @@ class SteamClipApp(QWidget):
         self.gameid_combo.currentIndexChanged.connect(self.filter_clips_by_gameid)
         self.media_type_combo.currentIndexChanged.connect(self.filter_media_type)
 
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Search by game name...")
+        self.search_input.setFixedHeight(40)
+        self.search_input.setClearButtonEnabled(True)
+
+        self.sort_combo = QComboBox()
+        self.sort_combo.setFixedSize(220, 40)
+        self.sort_combo.addItem("Newest first", "time_desc")
+        self.sort_combo.addItem("Oldest first", "time_asc")
+        self.sort_combo.addItem("Longest first", "dur_desc")
+        self.sort_combo.addItem("Shortest first", "dur_asc")
+        self.sort_combo.addItem("Largest file", "size_desc")
+        self.sort_combo.addItem("Smallest file", "size_asc")
+        self.sort_combo.setCurrentIndex(0)
+
+        self.search_input.textChanged.connect(self.apply_filters_and_sort)
+        self.sort_combo.currentIndexChanged.connect(self.apply_filters_and_sort)
+
         self.clip_grid = QGridLayout()
         self.clip_grid.setSpacing(15)
         self.clip_frame = QFrame()
@@ -393,6 +413,9 @@ class SteamClipApp(QWidget):
 
         self.clear_selection_button = self.create_button("Clear Selection", self.clear_selection, enabled=False, size=(150, 40))
         self.export_all_button = self.create_button("Export All", self.export_all, enabled=True, size=(150, 40))
+        self.reset_filters_button = self.create_button("Reset Filters", self.reset_filters, enabled=True, size=(150, 40))
+        self.results_label = QLabel("")
+        self.results_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
@@ -416,9 +439,16 @@ class SteamClipApp(QWidget):
         self.id_selection_layout.addWidget(self.gameid_combo)
         self.id_selection_layout.addWidget(self.media_type_combo)
 
+        self.search_sort_layout = QHBoxLayout()
+        self.search_sort_layout.addWidget(self.search_input, 1)
+        self.search_sort_layout.addWidget(self.sort_combo)
+        self.search_sort_layout.addWidget(self.reset_filters_button)
+        self.search_sort_layout.addWidget(self.results_label)
+
         self.main_layout = QVBoxLayout()
         self.main_layout.setContentsMargins(20, 20, 20, 20)
         self.main_layout.addLayout(self.id_selection_layout)
+        self.main_layout.addLayout(self.search_sort_layout)
         self.main_layout.addWidget(self.clip_frame)
         self.main_layout.addLayout(self.clear_selection_layout)
 
@@ -1041,9 +1071,11 @@ class SteamClipApp(QWidget):
                 self.clip_folders = clip_folders + video_folders
             self.clip_folders = sorted(self.clip_folders, key=lambda x: self.extract_datetime_from_folder_name(x), reverse=True)
             self.original_clip_folders = list(self.clip_folders)
+            self._duration_cache.clear()
+            self._size_cache.clear()
             logger(f"Media filter applied. Found {len(self.clip_folders)} clips total (type='{selected_media_type}').")
             self.populate_gameid_combo()
-            self.display_clips()
+            self.apply_filters_and_sort()
 
     def on_steamid_selected(self):
         selected_steamid = self.steamid_combo.currentText()
@@ -1150,34 +1182,76 @@ class SteamClipApp(QWidget):
         with open(self.GAME_IDS_FILE, 'w', encoding='utf-8') as f_obj:
             json.dump(self.game_ids, f_obj, indent=4, ensure_ascii=False)
 
-    def filter_clips_by_gameid(self):
+    def _game_id_of(self, folder):
+        parts = os.path.basename(folder).split('_')
+        return parts[1] if len(parts) > 1 else ""
+
+    def _update_selection_buttons(self):
+        has_selection = bool(self.selected_clips)
+        self.convert_button.setEnabled(has_selection)
+        self.clear_selection_button.setEnabled(has_selection)
+
+    def _sort_folders(self, folders, key_id):
+        sort_map = {
+            "time_desc": (self.extract_datetime_from_folder_name, True),
+            "time_asc": (self.extract_datetime_from_folder_name, False),
+            "dur_desc": (self.get_clip_duration_seconds, True),
+            "dur_asc": (self.get_clip_duration_seconds, False),
+            "size_desc": (self.get_clip_size_bytes, True),
+            "size_asc": (self.get_clip_size_bytes, False),
+        }
+        key_func, reverse = sort_map.get(key_id, (self.extract_datetime_from_folder_name, True))
+        folders = sorted(folders, key=lambda folder: os.path.basename(folder))
+        folders.sort(key=key_func, reverse=reverse)
+        return folders
+
+    def apply_filters_and_sort(self, *_args, reset_page=True):
+        folders = [folder for folder in self.original_clip_folders if self.find_session_mpd(folder)]
         selected_index = self.gameid_combo.currentIndex()
-        if selected_index == 0:
-            self.clip_folders = [
-                folder for folder in self.original_clip_folders
-                if self.find_session_mpd(folder)
-            ]
-        else:
+        if selected_index > 0:
             selected_game_id = self.gameid_combo.itemData(selected_index)
-            if not selected_game_id:
-                return
-            game_name = self.get_game_name(selected_game_id)
-            logger(f"Filtering clips by Game: {game_name} (ID: {selected_game_id})")
-            self.clip_folders = [
-                folder for folder in self.original_clip_folders
-                if f'_{selected_game_id}_' in folder and self.find_session_mpd(folder)
+            if selected_game_id:
+                folders = [folder for folder in folders if f'_{selected_game_id}_' in folder]
+        query = self.search_input.text().strip().lower()
+        if query:
+            folders = [
+                folder for folder in folders
+                if query in self.get_game_name(self._game_id_of(folder)).lower()
             ]
-        self.clip_index = 0
+        folders = self._sort_folders(folders, self.sort_combo.currentData())
+        self.clip_folders = folders
+        self.selected_clips &= set(self.clip_folders)
+        if reset_page or self.clip_index >= len(self.clip_folders):
+            self.clip_index = 0
+        self._update_selection_buttons()
+        logger(f"Filters applied: {len(self.clip_folders)} clips shown (search='{query}', sort='{self.sort_combo.currentData()}').")
         self.display_clips()
+
+    def filter_clips_by_gameid(self):
+        self.apply_filters_and_sort()
+
+    def reset_filters(self):
+        logger("User reset all filters.")
+        self.search_input.blockSignals(True)
+        self.search_input.clear()
+        self.search_input.blockSignals(False)
+        self.gameid_combo.blockSignals(True)
+        self.gameid_combo.setCurrentIndex(0)
+        self.gameid_combo.blockSignals(False)
+        self.sort_combo.blockSignals(True)
+        self.sort_combo.setCurrentIndex(0)
+        self.sort_combo.blockSignals(False)
+        self.apply_filters_and_sort()
 
     def display_clips(self):
         self.clear_clip_grid()
-        valid_clip_folders = [
-            folder for folder in self.clip_folders[self.clip_index:]
-            if self.find_session_mpd(folder)
-        ]
-        clips_to_show = valid_clip_folders[:6]
-        logger(f"Displaying clips {self.clip_index+1}-{self.clip_index+len(clips_to_show)} of {len(self.clip_folders)}")
+        clips_to_show = self.clip_folders[self.clip_index:self.clip_index + 6]
+        total = len(self.clip_folders)
+        logger(f"Displaying clips {self.clip_index+1}-{self.clip_index+len(clips_to_show)} of {total}")
+        if total == 0:
+            self.results_label.setText("No clips match")
+        else:
+            self.results_label.setText(f"Showing {self.clip_index + 1}-{self.clip_index + len(clips_to_show)} of {total}")
         for index, folder in enumerate(clips_to_show):
             session_mpd_files = self.find_session_mpd(folder)
             if not session_mpd_files:
@@ -1276,7 +1350,9 @@ class SteamClipApp(QWidget):
         except Exception as exc:
             logger(f"Error creating placeholder thumbnail {output_path}: {exc}")
 
-    def get_clip_duration(self, clip_folder):
+    def get_clip_duration_seconds(self, clip_folder):
+        if clip_folder in self._duration_cache:
+            return self._duration_cache[clip_folder]
         total_seconds = 0.0
         session_mpd_files = self.find_session_mpd(clip_folder)
         for session_mpd_path in session_mpd_files:
@@ -1303,9 +1379,27 @@ class SteamClipApp(QWidget):
                     logger(f"Attribute 'mediaPresentationDuration' not found in {session_mpd_path}")
             except Exception as exc:
                 logger(f"Error parsing mpd for duration {session_mpd_path}: {exc}")
+        self._duration_cache[clip_folder] = total_seconds
+        return total_seconds
+
+    def get_clip_duration(self, clip_folder):
+        total_seconds = self.get_clip_duration_seconds(clip_folder)
         minutes = int(total_seconds // 60)
         seconds = int(total_seconds % 60)
         return f"{minutes}:{seconds:02d}"
+
+    def get_clip_size_bytes(self, clip_folder):
+        if clip_folder in self._size_cache:
+            return self._size_cache[clip_folder]
+        total = 0
+        for root, _dirs, files in os.walk(clip_folder):
+            for file_name in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, file_name))
+                except OSError:
+                    pass
+        self._size_cache[clip_folder] = total
+        return total
 
     def add_thumbnail_to_grid(self, thumbnail_path, folder, index):
         container = ThumbnailFrame()
@@ -1351,8 +1445,7 @@ class SteamClipApp(QWidget):
         else:
             self.selected_clips.add(folder)
             container.setStyleSheet("border: 3px solid #66c0f4; border-radius: 4px;")
-        self.convert_button.setEnabled(bool(self.selected_clips))
-        self.clear_selection_button.setEnabled(len(self.selected_clips) >= 1)
+        self._update_selection_buttons()
 
     def update_navigation_buttons(self):
         self.prev_button.setEnabled(self.clip_index > 0)
@@ -1396,6 +1489,9 @@ class SteamClipApp(QWidget):
         self.gameid_combo.setEnabled(enabled)
         self.media_type_combo.setEnabled(enabled)
         self.settings_button.setEnabled(enabled)
+        self.search_input.setEnabled(enabled)
+        self.sort_combo.setEnabled(enabled)
+        self.reset_filters_button.setEnabled(enabled)
 
     def process_clips(self, selected_clips=None, export_all=False):
         logger(f"Initiating process_clips. ExportAll: {export_all}")
