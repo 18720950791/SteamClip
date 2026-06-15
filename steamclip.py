@@ -3,7 +3,10 @@ import os
 import sys
 import subprocess
 import json
-from typing import Optional
+from typing import Optional, List, Dict
+from enum import Enum
+from dataclasses import dataclass, field
+import uuid
 import webbrowser
 import imageio_ffmpeg as iio
 import logging
@@ -27,9 +30,9 @@ from PyQt6.QtWidgets import (
     QFrame, QComboBox, QDialog, QTableWidget,
     QTableWidgetItem, QTextEdit, QMessageBox,
     QFileDialog, QLayout, QProgressBar, QHeaderView,
-    QGroupBox
+    QGroupBox, QAbstractItemView, QScrollArea, QSizePolicy
 )
-from PyQt6.QtGui import QPixmap, QIcon, QDesktopServices, QColor, QGuiApplication
+from PyQt6.QtGui import QPixmap, QIcon, QDesktopServices, QColor, QGuiApplication, QBrush
 from PyQt6.QtCore import Qt, QUrl, QThread, pyqtSignal
 
 DEBUG = '-debug' in sys.argv
@@ -45,6 +48,123 @@ else:
     CONFIG_PATH = os.path.expanduser("~/.config/SteamClip")
 
 user_actions = []
+
+# ============ TASK QUEUE DATA MODELS ============
+
+class TaskStatus(Enum):
+    WAITING = "waiting"
+    PROCESSING = "processing"
+    SUCCESS = "success"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+@dataclass
+class ConversionTask:
+    id: str
+    clip_folder: str
+    status: TaskStatus = TaskStatus.WAITING
+    output_path: Optional[str] = None
+    error_message: Optional[str] = None
+    created_at: datetime = field(default_factory=datetime.now)
+
+    def clip_name(self) -> str:
+        """Extract readable clip name from folder path."""
+        return os.path.basename(self.clip_folder)
+
+class TaskQueue:
+    """Manages a queue of conversion tasks."""
+
+    def __init__(self):
+        self.tasks: List[ConversionTask] = []
+
+    def add_tasks(self, clip_folders: List[str]) -> List[str]:
+        """Add multiple tasks to the queue, return list of task IDs."""
+        task_ids = []
+        for folder in clip_folders:
+            task = ConversionTask(
+                id=str(uuid.uuid4())[:8],
+                clip_folder=folder
+            )
+            self.tasks.append(task)
+            task_ids.append(task.id)
+        logger(f"Added {len(task_ids)} tasks to queue.")
+        return task_ids
+
+    def get_next_waiting(self) -> Optional[ConversionTask]:
+        """Get the next waiting task, or None if all are processed."""
+        for task in self.tasks:
+            if task.status == TaskStatus.WAITING:
+                return task
+        return None
+
+    def get_task(self, task_id: str) -> Optional[ConversionTask]:
+        """Get a task by ID."""
+        for task in self.tasks:
+            if task.id == task_id:
+                return task
+        return None
+
+    def cancel_current(self) -> Optional[str]:
+        """Cancel the currently processing task. Returns task ID or None."""
+        for task in self.tasks:
+            if task.status == TaskStatus.PROCESSING:
+                task.status = TaskStatus.CANCELLED
+                task.error_message = "Cancelled by user"
+                logger(f"Task {task.id} cancelled.")
+                return task.id
+        return None
+
+    def remove_waiting(self, task_id: str) -> bool:
+        """Remove a waiting task from the queue."""
+        for i, task in enumerate(self.tasks):
+            if task.id == task_id and task.status == TaskStatus.WAITING:
+                self.tasks.pop(i)
+                logger(f"Removed waiting task {task_id} from queue.")
+                return True
+        return False
+
+    def remove_all_waiting(self) -> int:
+        """Remove all waiting tasks. Returns count removed."""
+        waiting = [t for t in self.tasks if t.status == TaskStatus.WAITING]
+        self.tasks = [t for t in self.tasks if t.status != TaskStatus.WAITING]
+        logger(f"Removed {len(waiting)} waiting tasks from queue.")
+        return len(waiting)
+
+    def retry_failed(self) -> List[str]:
+        """Reset all failed tasks to waiting status. Returns list of task IDs."""
+        retried = []
+        for task in self.tasks:
+            if task.status == TaskStatus.FAILED:
+                task.status = TaskStatus.WAITING
+                task.error_message = None
+                task.output_path = None
+                retried.append(task.id)
+        logger(f"Retried {len(retried)} failed tasks.")
+        return retried
+
+    def get_all_tasks(self) -> List[ConversionTask]:
+        """Get all tasks in queue order."""
+        return list(self.tasks)
+
+    def get_stats(self) -> Dict[str, int]:
+        """Get counts of tasks by status."""
+        stats = {status.value: 0 for status in TaskStatus}
+        for task in self.tasks:
+            stats[task.status.value] += 1
+        return stats
+
+    def is_finished(self) -> bool:
+        """Check if all tasks are in a terminal state."""
+        terminal = {TaskStatus.SUCCESS, TaskStatus.FAILED, TaskStatus.CANCELLED}
+        return all(task.status in terminal for task in self.tasks)
+
+    def has_waiting(self) -> bool:
+        """Check if there are any waiting tasks."""
+        return any(t.status == TaskStatus.WAITING for t in self.tasks)
+
+    def has_failed(self) -> bool:
+        """Check if there are any failed tasks."""
+        return any(t.status == TaskStatus.FAILED for t in self.tasks)
 
 def setup_logging():
     log_dir = os.path.join(SteamClipApp.CONFIG_DIR, 'logs')
@@ -329,6 +449,509 @@ class ConversionThread(QThread):
             counter += 1
         return unique_filename
 
+
+class ConversionWorker(QThread):
+    """Worker thread that processes tasks from a TaskQueue sequentially."""
+    task_started = pyqtSignal(str)  # task_id
+    task_progress = pyqtSignal(str, str, int)  # task_id, message, percent
+    task_completed = pyqtSignal(str, str)  # task_id, output_path
+    task_failed = pyqtSignal(str, str)  # task_id, error_message
+    queue_finished = pyqtSignal(dict)  # stats dict
+
+    def __init__(self, task_queue: TaskQueue, export_dir: str, game_ids: dict):
+        super().__init__()
+        self.task_queue = task_queue
+        self.export_dir = export_dir
+        self.game_ids = game_ids
+        self._cancel_requested = False
+        self._stop_all = False
+
+    def cancel_current(self):
+        """Request cancellation of the current task."""
+        logger("ConversionWorker: cancel current task requested.")
+        self._cancel_requested = True
+
+    def stop_all(self):
+        """Stop processing all remaining tasks."""
+        logger("ConversionWorker: stop all requested.")
+        self._stop_all = True
+        self._cancel_requested = True
+
+    def run(self):
+        """Process tasks from the queue sequentially."""
+        logger(f"ConversionWorker started. Queue has {len(self.task_queue.tasks)} tasks.")
+
+        while True:
+            if self._stop_all:
+                # Mark all waiting tasks as cancelled
+                for task in self.task_queue.get_all_tasks():
+                    if task.status == TaskStatus.WAITING:
+                        task.status = TaskStatus.CANCELLED
+                        task.error_message = "Queue stopped by user"
+                break
+
+            task = self.task_queue.get_next_waiting()
+            if task is None:
+                break
+
+            task.status = TaskStatus.PROCESSING
+            self._cancel_requested = False
+            self.task_started.emit(task.id)
+
+            try:
+                output_path = self._process_task(task)
+                if self._cancel_requested:
+                    task.status = TaskStatus.CANCELLED
+                    task.error_message = "Cancelled by user"
+                    self.task_failed.emit(task.id, "Cancelled by user")
+                else:
+                    task.status = TaskStatus.SUCCESS
+                    task.output_path = output_path
+                    self.task_completed.emit(task.id, output_path)
+            except Exception as exc:
+                if self._cancel_requested:
+                    task.status = TaskStatus.CANCELLED
+                    task.error_message = "Cancelled by user"
+                    self.task_failed.emit(task.id, "Cancelled by user")
+                else:
+                    task.status = TaskStatus.FAILED
+                    task.error_message = str(exc)
+                    self.task_failed.emit(task.id, str(exc))
+                logger(f"Task {task.id} failed: {exc}", exc_info=exc)
+
+        stats = self.task_queue.get_stats()
+        logger(f"ConversionWorker finished. Stats: {stats}")
+        self.queue_finished.emit(stats)
+
+    def _process_task(self, task: ConversionTask) -> str:
+        """Process a single conversion task. Returns output file path."""
+        clip_folder = task.clip_folder
+        temp_files = []
+
+        try:
+            self.task_progress.emit(task.id, "Finding session files...", 5)
+            session_mpd_files = self._find_session_mpd_files(clip_folder)
+
+            self.task_progress.emit(task.id, "Preparing temp media...", 15)
+            video_files, audio_files = self._prepare_temp_media_files(session_mpd_files)
+            temp_files.extend(video_files + audio_files)
+
+            if self._cancel_requested:
+                raise InterruptedError("Cancelled")
+
+            self.task_progress.emit(task.id, "Concatenating video segments...", 30)
+            concatenated_video = self._concatenate_media_files(video_files, is_video=True)
+            temp_files.append(concatenated_video)
+
+            if self._cancel_requested:
+                raise InterruptedError("Cancelled")
+
+            self.task_progress.emit(task.id, "Concatenating audio segments...", 55)
+            concatenated_audio = self._concatenate_media_files(audio_files, is_video=False)
+            temp_files.append(concatenated_audio)
+
+            if self._cancel_requested:
+                raise InterruptedError("Cancelled")
+
+            self.task_progress.emit(task.id, "Merging video and audio...", 80)
+            output_file = self._generate_and_merge_final_file(
+                concatenated_video, concatenated_audio, clip_folder
+            )
+
+            self.task_progress.emit(task.id, "Complete", 100)
+            logger(f"Task {task.id} completed: {output_file}")
+            return output_file
+
+        finally:
+            self._cleanup_temp_files(temp_files)
+
+    def _find_session_mpd_files(self, clip_folder):
+        session_mpd_files = []
+        for root, _, files in os.walk(clip_folder):
+            if 'session.mpd' in files:
+                session_mpd_files.append(os.path.join(root, 'session.mpd'))
+        if not session_mpd_files:
+            raise FileNotFoundError(f"No session.mpd files found in {clip_folder}")
+        return session_mpd_files
+
+    def _prepare_temp_media_files(self, session_mpd_files):
+        temp_video_paths = []
+        temp_audio_paths = []
+        for session_mpd in session_mpd_files:
+            data_dir = os.path.dirname(session_mpd)
+            video_path, audio_path = self._create_temp_media_file(data_dir)
+            temp_video_paths.append(video_path)
+            temp_audio_paths.append(audio_path)
+        return temp_video_paths, temp_audio_paths
+
+    def _create_temp_media_file(self, data_dir):
+        init_video = os.path.join(data_dir, 'init-stream0.m4s')
+        init_audio = os.path.join(data_dir, 'init-stream1.m4s')
+        if not (os.path.exists(init_video) and os.path.exists(init_audio)):
+            raise FileNotFoundError(f"Initialization files missing in {data_dir}")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_video:
+            with open(init_video, 'rb') as f:
+                tmp_video.write(f.read())
+            chunks = sorted(glob.glob(os.path.join(data_dir, 'chunk-stream0-*.m4s')))
+            for chunk in chunks:
+                with open(chunk, 'rb') as f:
+                    tmp_video.write(f.read())
+            temp_video_path = tmp_video.name
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_audio:
+            with open(init_audio, 'rb') as f:
+                tmp_audio.write(f.read())
+            chunks = sorted(glob.glob(os.path.join(data_dir, 'chunk-stream1-*.m4s')))
+            for chunk in chunks:
+                with open(chunk, 'rb') as f:
+                    tmp_audio.write(f.read())
+            temp_audio_path = tmp_audio.name
+        return temp_video_path, temp_audio_path
+
+    def _concatenate_media_files(self, media_paths, is_video=True):
+        ffmpeg_path = iio.get_ffmpeg_exe()
+        output_file = os.path.join(tempfile.gettempdir(), f"concat_{'video' if is_video else 'audio'}_{os.getpid()}_{hash(str(media_paths))}.mp4")
+        list_file = tempfile.NamedTemporaryFile(delete=False, mode='w', suffix=".txt")
+        for media_path in media_paths:
+            list_file.write(f"file '{media_path}'\n")
+        list_file.close()
+        try:
+            subprocess_args = {'check': True, 'stdout': subprocess.PIPE, 'stderr': subprocess.PIPE}
+            if IS_WINDOWS:
+                subprocess_args['creationflags'] = subprocess.CREATE_NO_WINDOW
+            command = [
+                ffmpeg_path, '-f', 'concat', '-safe', '0', '-i', list_file.name,
+                '-c', 'copy'
+            ]
+            if is_video:
+                command.extend(['-movflags', '+faststart', '-max_muxing_queue_size', '1024'])
+            command.append(output_file)
+            subprocess.run(command, **subprocess_args)
+            return output_file
+        finally:
+            os.unlink(list_file.name)
+
+    def _generate_and_merge_final_file(self, video_path, audio_path, clip_folder):
+        output_file = self._generate_output_filename(clip_folder)
+        ffmpeg_path = iio.get_ffmpeg_exe()
+        subprocess_args = {'check': True}
+        if IS_WINDOWS:
+            subprocess_args['creationflags'] = subprocess.CREATE_NO_WINDOW
+        logger(f"Merging to output file: {output_file}")
+        subprocess.run([
+            ffmpeg_path, '-i', video_path, '-i', audio_path, '-c', 'copy', output_file
+        ], **subprocess_args)
+        return output_file
+
+    def _generate_output_filename(self, clip_folder):
+        folder_basename = os.path.basename(clip_folder)
+        parts = folder_basename.split('_')
+        formatted_date = self._extract_date_from_folder_name(parts)
+        game_id = parts[1] if len(parts) > 1 else "UnknownGame"
+        game_name = self.game_ids.get(game_id)
+        if not game_name:
+            game_name = game_id
+        sanitized_game_name = pathvalidate.sanitize_filename(game_name)
+        base_filename_with_date = f"{sanitized_game_name}_{formatted_date}"
+        return self._get_unique_filename(self.export_dir, f"{base_filename_with_date}.mp4")
+
+    def _extract_date_from_folder_name(self, parts):
+        if len(parts) >= 3:
+            try:
+                datetime_str = parts[-2] + parts[-1]
+                dt_obj = datetime.strptime(datetime_str, "%Y%m%d%H%M%S")
+                return dt_obj.strftime("%Y-%m-%d_%H-%M-%S")
+            except ValueError:
+                pass
+        return "UnknownDate"
+
+    def _cleanup_temp_files(self, file_paths):
+        count = 0
+        for file_path in file_paths:
+            if file_path and os.path.exists(file_path):
+                try:
+                    os.unlink(file_path)
+                    count += 1
+                except Exception as exc:
+                    logger(f"Error cleaning up temp file {file_path}: {str(exc)}")
+        if count > 0:
+            logger(f"Cleaned up {count} temporary files.")
+
+    @staticmethod
+    def _get_unique_filename(directory, filename):
+        base_name, ext = os.path.splitext(filename)
+        counter = 1
+        unique_filename = os.path.join(directory, filename)
+        while os.path.exists(unique_filename):
+            unique_filename = os.path.join(directory, f"{base_name}_{counter}{ext}")
+            counter += 1
+        return unique_filename
+
+
+class TaskQueueDialog(QDialog):
+    """Dialog showing task queue status and controls."""
+
+    retry_requested = pyqtSignal()
+
+    STATUS_COLORS = {
+        TaskStatus.WAITING: "#888888",
+        TaskStatus.PROCESSING: "#66c0f4",
+        TaskStatus.SUCCESS: "#4caf50",
+        TaskStatus.FAILED: "#f44336",
+        TaskStatus.CANCELLED: "#ff9800",
+    }
+
+    STATUS_LABELS = {
+        TaskStatus.WAITING: "⏳ Waiting",
+        TaskStatus.PROCESSING: "⚙ Processing...",
+        TaskStatus.SUCCESS: "✓ Success",
+        TaskStatus.FAILED: "✗ Failed",
+        TaskStatus.CANCELLED: "⊘ Cancelled",
+    }
+
+    def __init__(self, task_queue: TaskQueue, parent=None):
+        super().__init__(parent)
+        self.task_queue = task_queue
+        self.setWindowTitle("Conversion Queue")
+        self.setWindowIcon(QIcon('SteamClip.ico'))
+        self.setMinimumSize(800, 500)
+        self.setModal(False)
+
+        self._setup_ui()
+        self._refresh_table()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        # Summary label
+        self.summary_label = QLabel()
+        self.summary_label.setStyleSheet("font-size: 14px; padding: 8px;")
+        layout.addWidget(self.summary_label)
+
+        # Progress bar for current task
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setFixedHeight(25)
+        self.progress_bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.progress_bar)
+
+        # Task table
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["#", "Clip Name", "Status", "Output / Error"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.verticalHeader().setVisible(False)
+        layout.addWidget(self.table)
+
+        # Button row
+        button_layout = QHBoxLayout()
+
+        self.cancel_current_btn = QPushButton("Cancel Current")
+        self.cancel_current_btn.setFixedSize(140, 36)
+        self.cancel_current_btn.clicked.connect(self._on_cancel_current)
+
+        self.remove_pending_btn = QPushButton("Remove All Pending")
+        self.remove_pending_btn.setFixedSize(160, 36)
+        self.remove_pending_btn.clicked.connect(self._on_remove_pending)
+
+        self.retry_failed_btn = QPushButton("Retry Failed")
+        self.retry_failed_btn.setFixedSize(130, 36)
+        self.retry_failed_btn.clicked.connect(self._on_retry_failed)
+        self.retry_failed_btn.setVisible(False)
+
+        self.open_folder_btn = QPushButton("Open Output Folder")
+        self.open_folder_btn.setFixedSize(160, 36)
+        self.open_folder_btn.clicked.connect(self._on_open_folder)
+        self.open_folder_btn.setVisible(False)
+
+        self.close_btn = QPushButton("Close")
+        self.close_btn.setFixedSize(100, 36)
+        self.close_btn.clicked.connect(self.close)
+
+        button_layout.addWidget(self.cancel_current_btn)
+        button_layout.addWidget(self.remove_pending_btn)
+        button_layout.addWidget(self.retry_failed_btn)
+        button_layout.addWidget(self.open_folder_btn)
+        button_layout.addStretch()
+        button_layout.addWidget(self.close_btn)
+
+        layout.addLayout(button_layout)
+        self.setLayout(layout)
+
+    def _refresh_table(self):
+        """Refresh the task table from the queue."""
+        tasks = self.task_queue.get_all_tasks()
+        self.table.setRowCount(len(tasks))
+
+        for row, task in enumerate(tasks):
+            # Task number
+            num_item = QTableWidgetItem(str(row + 1))
+            num_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(row, 0, num_item)
+
+            # Clip name
+            name_item = QTableWidgetItem(task.clip_name())
+            self.table.setItem(row, 1, name_item)
+
+            # Status
+            status_item = QTableWidgetItem(self.STATUS_LABELS.get(task.status, str(task.status)))
+            color = self.STATUS_COLORS.get(task.status, "#ffffff")
+            status_item.setForeground(QBrush(QColor(color)))
+            status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(row, 2, status_item)
+
+            # Output or error
+            if task.status == TaskStatus.SUCCESS and task.output_path:
+                detail_item = QTableWidgetItem(task.output_path)
+                detail_item.setForeground(QBrush(QColor("#4caf50")))
+            elif task.status == TaskStatus.FAILED and task.error_message:
+                detail_item = QTableWidgetItem(task.error_message)
+                detail_item.setForeground(QBrush(QColor("#f44336")))
+            elif task.status == TaskStatus.CANCELLED:
+                detail_item = QTableWidgetItem(task.error_message or "Cancelled")
+                detail_item.setForeground(QBrush(QColor("#ff9800")))
+            else:
+                detail_item = QTableWidgetItem("")
+            self.table.setItem(row, 3, detail_item)
+
+        # Update summary
+        stats = self.task_queue.get_stats()
+        self.summary_label.setText(
+            f"Total: {len(tasks)}  |  "
+            f"Waiting: {stats['waiting']}  |  "
+            f"Processing: {stats['processing']}  |  "
+            f"Success: {stats['success']}  |  "
+            f"Failed: {stats['failed']}  |  "
+            f"Cancelled: {stats['cancelled']}"
+        )
+
+        # Update button states
+        has_processing = stats['processing'] > 0
+        has_waiting = stats['waiting'] > 0
+        has_failed = stats['failed'] > 0
+        is_finished = self.task_queue.is_finished()
+
+        self.cancel_current_btn.setEnabled(has_processing)
+        self.remove_pending_btn.setEnabled(has_waiting)
+        self.retry_failed_btn.setVisible(is_finished and has_failed)
+        self.open_folder_btn.setVisible(stats['success'] > 0)
+
+        # Hide progress bar if nothing processing
+        if not has_processing:
+            self.progress_bar.setVisible(False)
+
+    def on_task_started(self, task_id: str):
+        """Called when a task starts processing."""
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat(f"Processing: {task_id}...")
+        self._refresh_table()
+        self._scroll_to_task(task_id)
+
+    def on_task_progress(self, task_id: str, message: str, percent: int):
+        """Called when a task reports progress."""
+        self.progress_bar.setFormat(f"{message} ({percent}%)")
+        self.progress_bar.setValue(percent)
+
+    def on_task_completed(self, task_id: str, output_path: str):
+        """Called when a task completes successfully."""
+        self._refresh_table()
+
+    def on_task_failed(self, task_id: str, error: str):
+        """Called when a task fails."""
+        self._refresh_table()
+
+    def on_queue_finished(self, stats: dict):
+        """Called when all tasks are done."""
+        self.progress_bar.setVisible(False)
+        self._refresh_table()
+
+        total = sum(stats.values())
+        success = stats.get('success', 0)
+        failed = stats.get('failed', 0)
+        cancelled = stats.get('cancelled', 0)
+
+        # Build summary message
+        msg_parts = []
+        if success > 0:
+            msg_parts.append(f"{success} succeeded")
+        if failed > 0:
+            msg_parts.append(f"{failed} failed")
+        if cancelled > 0:
+            msg_parts.append(f"{cancelled} cancelled")
+
+        summary = f"Queue finished: {', '.join(msg_parts)} (total: {total})"
+
+        # Collect output paths and errors
+        output_paths = []
+        errors = []
+        for task in self.task_queue.get_all_tasks():
+            if task.status == TaskStatus.SUCCESS and task.output_path:
+                output_paths.append(f"  • {task.clip_name()} → {task.output_path}")
+            elif task.status == TaskStatus.FAILED and task.error_message:
+                errors.append(f"  • {task.clip_name()}: {task.error_message}")
+
+        detail_lines = [summary, ""]
+        if output_paths:
+            detail_lines.append("Successful conversions:")
+            detail_lines.extend(output_paths)
+            detail_lines.append("")
+        if errors:
+            detail_lines.append("Failed conversions:")
+            detail_lines.extend(errors)
+
+        detail_text = "\n".join(detail_lines)
+
+        # Show summary in a message box
+        if failed > 0:
+            QMessageBox.warning(self, "Conversion Queue - Completed with Errors", detail_text)
+        else:
+            QMessageBox.information(self, "Conversion Queue - Completed", detail_text)
+
+    def _scroll_to_task(self, task_id: str):
+        """Scroll the table to show the given task."""
+        tasks = self.task_queue.get_all_tasks()
+        for row, task in enumerate(tasks):
+            if task.id == task_id:
+                self.table.scrollToItem(self.table.item(row, 0))
+                break
+
+    def _on_cancel_current(self):
+        """Cancel the currently processing task."""
+        cancelled_id = self.task_queue.cancel_current()
+        if cancelled_id:
+            logger(f"Task {cancelled_id} cancelled via dialog.")
+            self._refresh_table()
+
+    def _on_remove_pending(self):
+        """Remove all waiting tasks."""
+        count = self.task_queue.remove_all_waiting()
+        logger(f"Removed {count} pending tasks via dialog.")
+        self._refresh_table()
+
+    def _on_retry_failed(self):
+        """Emit signal to retry failed tasks."""
+        retried = self.task_queue.retry_failed()
+        if retried:
+            logger(f"Retrying {len(retried)} failed tasks via dialog.")
+            self._refresh_table()
+            self.retry_requested.emit()
+
+    def _on_open_folder(self):
+        """Open the export folder in file manager."""
+        for task in self.task_queue.get_all_tasks():
+            if task.status == TaskStatus.SUCCESS and task.output_path:
+                folder = os.path.dirname(task.output_path)
+                if os.path.isdir(folder):
+                    QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+                    return
+
+
 class SteamClipApp(QWidget):
     CONFIG_DIR = CONFIG_PATH
     CONFIG_FILE = os.path.join(CONFIG_DIR, 'SteamClip.conf')
@@ -357,6 +980,9 @@ class SteamClipApp(QWidget):
         self.wait_message = None
         self.settings_window = None
         self.conversion_thread = None
+        self.task_queue = None
+        self.conversion_worker = None
+        self.task_queue_dialog = None
         self.current_theme = self.config.get('theme', 'Steam Dark')
 
         first_run = not os.path.exists(self.CONFIG_FILE)
@@ -429,11 +1055,13 @@ class SteamClipApp(QWidget):
         self.exit_button.setProperty("class", "secondary")
         self.prev_button = self.create_button("<< Previous", self.show_previous_clips)
         self.next_button = self.create_button("Next >>", self.show_next_clips)
+        self.view_queue_button = self.create_button("View Queue", self.show_task_queue_dialog, enabled=False)
 
         self.bottom_layout = QHBoxLayout()
         self.bottom_layout.addWidget(self.prev_button)
         self.bottom_layout.addWidget(self.next_button)
         self.bottom_layout.addWidget(self.convert_button)
+        self.bottom_layout.addWidget(self.view_queue_button)
         self.bottom_layout.addWidget(self.exit_button)
         self.main_layout.addLayout(self.bottom_layout)
         self.setLayout(self.main_layout)
@@ -1386,6 +2014,58 @@ class SteamClipApp(QWidget):
         logger("Conversion thread terminated.")
         self.conversion_thread = None
 
+    # ============ TASK QUEUE SIGNAL HANDLERS ============
+
+    def on_worker_task_started(self, task_id: str):
+        """Handle task started signal from worker."""
+        logger(f"Task {task_id} started.")
+        self.view_queue_button.setEnabled(True)
+        if self.task_queue_dialog:
+            self.task_queue_dialog.on_task_started(task_id)
+
+    def on_worker_task_progress(self, task_id: str, message: str, percent: int):
+        """Handle task progress signal from worker."""
+        if self.task_queue_dialog:
+            self.task_queue_dialog.on_task_progress(task_id, message, percent)
+
+    def on_worker_task_completed(self, task_id: str, output_path: str):
+        """Handle task completed signal from worker."""
+        logger(f"Task {task_id} completed: {output_path}")
+        if self.task_queue_dialog:
+            self.task_queue_dialog.on_task_completed(task_id, output_path)
+
+    def on_worker_task_failed(self, task_id: str, error: str):
+        """Handle task failed signal from worker."""
+        logger(f"Task {task_id} failed: {error}")
+        if self.task_queue_dialog:
+            self.task_queue_dialog.on_task_failed(task_id, error)
+
+    def on_worker_queue_finished(self, stats: dict):
+        """Handle queue finished signal from worker."""
+        logger(f"Queue finished. Stats: {stats}")
+        self.progress_bar.setVisible(False)
+        if self.task_queue_dialog:
+            self.task_queue_dialog.on_queue_finished(stats)
+        # Clear selection if not export_all
+        if not self._last_export_all:
+            self.selected_clips.clear()
+            self.display_clips()
+        # Re-enable interface
+        self.toggle_interface(enabled=True)
+
+    def on_worker_finished(self):
+        """Handle worker thread finished."""
+        logger("ConversionWorker thread terminated.")
+        self.conversion_worker = None
+        # Update view queue button state
+        self.view_queue_button.setEnabled(False)
+
+    def on_retry_requested(self):
+        """Handle retry request from dialog - restart worker for retried tasks."""
+        if self.task_queue and self.task_queue.has_waiting():
+            self._start_worker()
+            self.view_queue_button.setEnabled(True)
+
     def toggle_interface(self, enabled):
         self.convert_button.setEnabled(enabled and bool(self.selected_clips))
         self.export_all_button.setEnabled(enabled and bool(self.clip_folders))
@@ -1396,9 +2076,37 @@ class SteamClipApp(QWidget):
         self.gameid_combo.setEnabled(enabled)
         self.media_type_combo.setEnabled(enabled)
         self.settings_button.setEnabled(enabled)
+        # View Queue button enabled only when there's an active queue
+        self.view_queue_button.setEnabled(self.task_queue is not None and not self.task_queue.is_finished())
+
+    def show_task_queue_dialog(self):
+        """Show the task queue dialog if a queue exists."""
+        if self.task_queue_dialog:
+            self.task_queue_dialog.show()
+            self.task_queue_dialog.raise_()
+            self.task_queue_dialog.activateWindow()
+        elif self.task_queue:
+            self.task_queue_dialog = TaskQueueDialog(self.task_queue, parent=self)
+            self.task_queue_dialog.retry_requested.connect(self.on_retry_requested)
+            self.task_queue_dialog.show()
+
+    def _start_worker(self):
+        """Start the ConversionWorker with the current task_queue."""
+        self.conversion_worker = ConversionWorker(
+            self.task_queue,
+            self.export_dir,
+            self.game_ids
+        )
+        self.conversion_worker.task_started.connect(self.on_worker_task_started)
+        self.conversion_worker.task_progress.connect(self.on_worker_task_progress)
+        self.conversion_worker.task_completed.connect(self.on_worker_task_completed)
+        self.conversion_worker.task_failed.connect(self.on_worker_task_failed)
+        self.conversion_worker.queue_finished.connect(self.on_worker_queue_finished)
+        self.conversion_worker.finished.connect(self.on_worker_finished)
+        self.conversion_worker.start()
 
     def process_clips(self, selected_clips=None, export_all=False):
-        logger(f"Initiating process_clips. ExportAll: {export_all}")
+        logger(f"Initiating process_clips with task queue. ExportAll: {export_all}")
         if not self.validate_export_directory():
             return False
         clip_list = self.get_clips_to_process(selected_clips, export_all)
@@ -1406,21 +2114,28 @@ class SteamClipApp(QWidget):
             logger("Process cancelled: No clips to process.")
             self.show_error("No clips to process")
             return False
+
+        # Store export_all flag for later use in on_worker_queue_finished
+        self._last_export_all = export_all
+
+        # Create task queue
+        self.task_queue = TaskQueue()
+        self.task_queue.add_tasks(clip_list)
+
+        # Disable interface
+        self.toggle_interface(enabled=False)
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 100)
-        self.progress_bar.setFormat("Initializing conversion...")
-        self.toggle_interface(enabled=False)
-        self.conversion_thread = ConversionThread(
-            clip_list,
-            self.export_dir,
-            self.game_ids,
-            export_all
-        )
-        self.conversion_thread.progress_update.connect(self.on_progress_update)
-        self.conversion_thread.finished_signal.connect(self.on_conversion_finished)
-        self.conversion_thread.finished.connect(self.on_thread_finished)
-        self.conversion_thread.start()
+        self.progress_bar.setFormat(f"Queued {len(clip_list)} task(s)...")
+
+        # Show task queue dialog
+        self.task_queue_dialog = TaskQueueDialog(self.task_queue, parent=self)
+        self.task_queue_dialog.retry_requested.connect(self.on_retry_requested)
+        self.task_queue_dialog.show()
+
+        # Start worker
+        self._start_worker()
         return True
 
     def validate_export_directory(self):
