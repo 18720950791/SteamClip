@@ -11,12 +11,14 @@ import traceback
 import shutil
 import tempfile
 import glob
+import hashlib
+import threading
+import time
 import requests
 import pathvalidate
 import platform
 import xml.etree.ElementTree as ElTree
 from datetime import datetime
-from PIL import Image, ImageDraw, ImageFont
 import getpass
 import struct
 import zlib
@@ -30,7 +32,7 @@ from PyQt6.QtWidgets import (
     QGroupBox
 )
 from PyQt6.QtGui import QPixmap, QIcon, QDesktopServices, QColor, QGuiApplication
-from PyQt6.QtCore import Qt, QUrl, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QUrl, QThread, pyqtSignal, QObject, QRunnable, QThreadPool, QTimer
 
 DEBUG = '-debug' in sys.argv
 IS_WINDOWS = sys.platform == 'win32'
@@ -329,6 +331,237 @@ class ConversionThread(QThread):
             counter += 1
         return unique_filename
 
+
+# ============ THUMBNAIL CACHE & ASYNC GENERATION ============
+
+def _read_mpd_duration_attr(session_mpd_path):
+    """Return the raw mediaPresentationDuration attribute of the MPD (media metadata used
+    as part of the cache fingerprint). Empty string on any failure."""
+    try:
+        tree = ElTree.parse(session_mpd_path)
+        return tree.getroot().attrib.get('mediaPresentationDuration', '')
+    except Exception:
+        return ''
+
+
+def _thumb_fingerprint(session_mpd_path):
+    """Invalidation fingerprint built from the source path, the mtime/size of the files
+    that actually feed FFmpeg (session.mpd, init-stream0, first chunk), the chunk count
+    and the MPD media duration. Any source change yields a different fingerprint."""
+    data_dir = os.path.dirname(session_mpd_path)
+
+    def stat_sig(path):
+        try:
+            st = os.stat(path)
+            return f"{os.path.basename(path)}:{int(st.st_mtime)}:{st.st_size}"
+        except OSError:
+            return f"{os.path.basename(path)}:0:0"
+
+    parts = [os.path.abspath(session_mpd_path), stat_sig(session_mpd_path)]
+    parts.append(stat_sig(os.path.join(data_dir, 'init-stream0.m4s')))
+    chunks = sorted(glob.glob(os.path.join(data_dir, 'chunk-stream0-*.m4s')))
+    parts.append(f"chunks:{len(chunks)}")
+    if chunks:
+        parts.append(stat_sig(chunks[0]))
+    parts.append(f"dur:{_read_mpd_duration_attr(session_mpd_path)}")
+    return hashlib.sha1("|".join(parts).encode('utf-8')).hexdigest()
+
+
+def generate_thumbnail_file(session_mpd_path, out_path):
+    """Qt-free thumbnail generator suitable for a worker thread. Extracts the first frame
+    via FFmpeg and writes it atomically to out_path. Returns True on success."""
+    temp_video_path = None
+    tmp_out = out_path + ".tmp"
+    try:
+        ffmpeg_path = iio.get_ffmpeg_exe()
+        data_dir = os.path.dirname(session_mpd_path)
+        init_video = os.path.join(data_dir, 'init-stream0.m4s')
+        chunk_video_list = sorted(glob.glob(os.path.join(data_dir, 'chunk-stream0-*.m4s')))
+        if not os.path.exists(init_video) or not chunk_video_list:
+            logger(f"Missing video files for thumbnail generation in: {data_dir}")
+            return False
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_video:
+            temp_video_path = tmp_video.name
+            with open(init_video, 'rb') as f_init:
+                shutil.copyfileobj(f_init, tmp_video)
+            first_chunk = chunk_video_list[0]
+            if not (os.path.exists(first_chunk) and os.access(first_chunk, os.R_OK)):
+                logger(f"First Chunk missing for thumbnail: {first_chunk}")
+                return False
+            with open(first_chunk, 'rb') as f_chunk:
+                shutil.copyfileobj(f_chunk, tmp_video)
+        command = [
+            ffmpeg_path, '-y',
+            '-ss', '00:00:00.000',
+            '-i', temp_video_path,
+            '-vframes', '1',
+            '-q:v', '2',
+            tmp_out
+        ]
+        run_kwargs = {'stdout': subprocess.PIPE, 'stderr': subprocess.PIPE, 'text': True}
+        if IS_WINDOWS:
+            run_kwargs['creationflags'] = subprocess.CREATE_NO_WINDOW
+        result = subprocess.run(command, **run_kwargs)
+        if result.returncode == 0 and os.path.exists(tmp_out):
+            os.replace(tmp_out, out_path)
+            if DEBUG:
+                logger(f"Thumbnail extracted: {out_path}")
+            return True
+        logger(f"FFMPEG failed to extract thumbnail {session_mpd_path}: {result.stderr}")
+        return False
+    except Exception as exc:
+        logger(f"Error generating thumbnail {session_mpd_path}: {exc}")
+        return False
+    finally:
+        for path in (temp_video_path, tmp_out):
+            if path and os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+
+
+class ThumbnailCache:
+    """Invalidatable, on-disk thumbnail cache.
+
+    The index (CONFIG_DIR/thumbnail_cache.json) maps a clip folder to its content
+    fingerprint, the cached image filename and the last access time. A lookup is only a
+    hit when the freshly computed fingerprint still matches, so any source change forces
+    regeneration. Images live in CONFIG_DIR/thumbnails/<fingerprint>.jpg."""
+
+    INDEX_VERSION = 1
+
+    def __init__(self, cache_dir, index_file, ttl_seconds=30 * 24 * 3600, max_entries=600):
+        self.cache_dir = cache_dir
+        self.index_file = index_file
+        self.ttl = ttl_seconds
+        self.max_entries = max_entries
+        self._lock = threading.Lock()
+        self._index = {}
+        self._dirty = False
+        os.makedirs(self.cache_dir, exist_ok=True)
+        self._load()
+
+    def _load(self):
+        if not os.path.exists(self.index_file):
+            return
+        try:
+            with open(self.index_file, 'r', encoding='utf-8') as f_obj:
+                data = json.load(f_obj)
+            if isinstance(data, dict) and data.get('version') == self.INDEX_VERSION:
+                entries = data.get('entries', {})
+                if isinstance(entries, dict):
+                    self._index = entries
+        except (OSError, ValueError) as exc:
+            logger(f"Failed to load thumbnail cache index, starting fresh: {exc}")
+            self._index = {}
+
+    def thumb_path_for(self, fingerprint):
+        return os.path.join(self.cache_dir, f"{fingerprint}.jpg")
+
+    def lookup(self, folder, fingerprint):
+        """Return the cached thumbnail path when the fingerprint matches and the file
+        exists, else None. Prunes stale/missing entries and refreshes last access."""
+        with self._lock:
+            entry = self._index.get(folder)
+            if not entry or entry.get('fingerprint') != fingerprint:
+                return None
+            thumb_name = entry.get('thumb', '')
+            thumb_path = os.path.join(self.cache_dir, thumb_name)
+            if not thumb_name or not os.path.exists(thumb_path):
+                self._index.pop(folder, None)
+                self._dirty = True
+                return None
+            entry['last_access'] = time.time()
+            self._dirty = True
+            return thumb_path
+
+    def commit(self, folder, fingerprint, thumb_abs_path):
+        with self._lock:
+            self._index[folder] = {
+                'fingerprint': fingerprint,
+                'thumb': os.path.basename(thumb_abs_path),
+                'last_access': time.time(),
+            }
+            self._dirty = True
+
+    def save_if_dirty(self):
+        with self._lock:
+            if not self._dirty:
+                return
+            data = {'version': self.INDEX_VERSION, 'entries': self._index}
+            tmp = self.index_file + '.tmp'
+            try:
+                with open(tmp, 'w', encoding='utf-8') as f_obj:
+                    json.dump(data, f_obj)
+                os.replace(tmp, self.index_file)
+                self._dirty = False
+            except OSError as exc:
+                logger(f"Failed to save thumbnail cache index: {exc}")
+
+    def cleanup(self):
+        """Drop entries whose source folder is gone, whose image is missing or that
+        expired past the TTL; evict least-recently-used entries beyond max_entries; then
+        remove orphaned image files. Safe to run on a background thread."""
+        with self._lock:
+            now = time.time()
+            for folder in list(self._index.keys()):
+                entry = self._index[folder]
+                thumb_path = os.path.join(self.cache_dir, entry.get('thumb', ''))
+                expired = (now - entry.get('last_access', 0)) > self.ttl
+                if not os.path.isdir(folder) or expired or not os.path.exists(thumb_path):
+                    self._index.pop(folder, None)
+                    self._dirty = True
+            if len(self._index) > self.max_entries:
+                ordered = sorted(self._index.items(), key=lambda kv: kv[1].get('last_access', 0))
+                for folder, _entry in ordered[:len(self._index) - self.max_entries]:
+                    self._index.pop(folder, None)
+                    self._dirty = True
+            referenced = {entry.get('thumb') for entry in self._index.values()}
+            try:
+                for fname in os.listdir(self.cache_dir):
+                    if fname.endswith('.jpg') and fname not in referenced:
+                        try:
+                            os.remove(os.path.join(self.cache_dir, fname))
+                        except OSError:
+                            pass
+            except OSError:
+                pass
+        self.save_if_dirty()
+
+
+class ThumbnailWorkerSignals(QObject):
+    finished = pyqtSignal(str, str, str, bool)  # folder, fingerprint, thumb_path, ok
+
+
+class ThumbnailWorker(QRunnable):
+    def __init__(self, folder, session_mpd_path, fingerprint, out_path):
+        super().__init__()
+        self.folder = folder
+        self.session_mpd_path = session_mpd_path
+        self.fingerprint = fingerprint
+        self.out_path = out_path
+        self.signals = ThumbnailWorkerSignals()
+
+    def run(self):
+        ok = generate_thumbnail_file(self.session_mpd_path, self.out_path)
+        self.signals.finished.emit(
+            self.folder, self.fingerprint, self.out_path if ok else "", ok
+        )
+
+
+class _CacheCleanupWorker(QRunnable):
+    def __init__(self, cache):
+        super().__init__()
+        self.cache = cache
+
+    def run(self):
+        try:
+            self.cache.cleanup()
+        except Exception as exc:
+            logger(f"Thumbnail cache cleanup failed: {exc}")
+
+
 class SteamClipApp(QWidget):
     CONFIG_DIR = CONFIG_PATH
     CONFIG_FILE = os.path.join(CONFIG_DIR, 'SteamClip.conf')
@@ -358,6 +591,17 @@ class SteamClipApp(QWidget):
         self.settings_window = None
         self.conversion_thread = None
         self.current_theme = self.config.get('theme', 'Steam Dark')
+
+        self.thumbnail_cache = ThumbnailCache(
+            cache_dir=os.path.join(self.CONFIG_DIR, 'thumbnails'),
+            index_file=os.path.join(self.CONFIG_DIR, 'thumbnail_cache.json'),
+        )
+        self.thumb_pool = QThreadPool()
+        self.thumb_pool.setMaxThreadCount(3)
+        self._thumb_gen = 0
+        self._thumb_inflight = set()
+        self._thumb_pending = {}
+        self._thumb_workers = {}
 
         first_run = not os.path.exists(self.CONFIG_FILE)
         if not self.default_dir:
@@ -448,6 +692,7 @@ class SteamClipApp(QWidget):
         self.populate_steamid_dirs()
         self.perform_update_check()
         logger("Application UI Setup Complete.")
+        QTimer.singleShot(1500, self._start_cache_cleanup)
         if first_run:
             logger("First run detected. Info message displayed.")
             QMessageBox.information(self, "INFO",
@@ -1172,6 +1417,9 @@ class SteamClipApp(QWidget):
 
     def display_clips(self):
         self.clear_clip_grid()
+        self._thumb_gen += 1
+        gen = self._thumb_gen
+        self._thumb_pending = {}
         valid_clip_folders = [
             folder for folder in self.clip_folders[self.clip_index:]
             if self.find_session_mpd(folder)
@@ -1183,21 +1431,14 @@ class SteamClipApp(QWidget):
             if not session_mpd_files:
                 continue
             first_session_mpd = session_mpd_files[0]
-            thumbnail_path = os.path.join(folder, 'thumbnail.jpg')
-            if first_session_mpd and not os.path.exists(thumbnail_path):
-                self.extract_first_frame(first_session_mpd, thumbnail_path)
-            if not os.path.exists(thumbnail_path):
-                try:
-                    fallback_path = os.path.join(tempfile.gettempdir(), f"steamclip_thumb_{index}.jpg")
-                    self.create_placeholder_thumbnail(fallback_path)
-                    if os.path.exists(fallback_path):
-                        thumbnail_path = fallback_path
-                except Exception as exc:
-                    logger(f"Last-resort placeholder also failed for {folder}: {exc}")
-            if os.path.exists(thumbnail_path):
-                self.add_thumbnail_to_grid(thumbnail_path, folder, index)
+            fingerprint = _thumb_fingerprint(first_session_mpd)
+            cached_path = self.thumbnail_cache.lookup(folder, fingerprint)
+            if cached_path:
+                self.add_thumbnail_to_grid(cached_path, folder, index)
             else:
-                logger(f"WARNING: Could not create any thumbnail for clip: {folder}")
+                _container, label = self.add_loading_tile(folder, index)
+                self._thumb_pending[folder] = (label, gen)
+                self._enqueue_thumbnail(folder, first_session_mpd, fingerprint)
         placeholders_needed = 6 - len(clips_to_show)
         for i in range(placeholders_needed):
             placeholder = QFrame()
@@ -1210,71 +1451,46 @@ class SteamClipApp(QWidget):
                 widget.setStyleSheet("border: 3px solid #66c0f4; border-radius: 4px;")
         self.update_navigation_buttons()
         self.export_all_button.setEnabled(bool(self.clip_folders))
+        self.thumbnail_cache.save_if_dirty()
 
-    def extract_first_frame(self, session_mpd_path, output_thumbnail_path):
-        temp_video_path = None
+    def _enqueue_thumbnail(self, folder, session_mpd_path, fingerprint):
+        if folder in self._thumb_inflight:
+            return  # dedup: a worker for this folder is already running
+        self._thumb_inflight.add(folder)
+        out_path = self.thumbnail_cache.thumb_path_for(fingerprint)
+        worker = ThumbnailWorker(folder, session_mpd_path, fingerprint, out_path)
+        worker.setAutoDelete(False)
+        # Keep a reference so the worker (and its signal emitter) outlives delivery of the
+        # queued finished signal; released in _on_thumb_ready on the main thread.
+        self._thumb_workers[folder] = worker
+        worker.signals.finished.connect(self._on_thumb_ready)
+        self.thumb_pool.start(worker)
+
+    def _on_thumb_ready(self, folder, fingerprint, thumb_path, ok):
+        # Runs on the main thread (queued signal). Commit to the cache regardless of
+        # whether the clip is still on screen, so a late result still warms the cache.
+        self._thumb_inflight.discard(folder)
+        self._thumb_workers.pop(folder, None)
+        if ok and thumb_path and os.path.exists(thumb_path):
+            self.thumbnail_cache.commit(folder, fingerprint, thumb_path)
+            self.thumbnail_cache.save_if_dirty()
+        pending = self._thumb_pending.get(folder)
+        if not pending:
+            return  # clip was scrolled/filtered away -> drop result (cache now warm)
+        label, gen = pending
+        if gen != self._thumb_gen:
+            return  # stale generation -> never overwrite the current page
+        self._thumb_pending.pop(folder, None)
         try:
-            ffmpeg_path = iio.get_ffmpeg_exe()
-            data_dir = os.path.dirname(session_mpd_path)
-            init_video = os.path.join(data_dir, 'init-stream0.m4s')
-            chunk_video_pattern = os.path.join(data_dir, 'chunk-stream0-*.m4s')
-            chunk_video_list = sorted(glob.glob(chunk_video_pattern))
-            if not os.path.exists(init_video) or not chunk_video_list:
-                logger(f"Missing video files for thumbnail generation in: {data_dir}")
-                self.create_placeholder_thumbnail(output_thumbnail_path)
-                return
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp_video:
-                temp_video_path = tmp_video.name
-                with open(init_video, 'rb') as f_init:
-                    shutil.copyfileobj(f_init, tmp_video)
-                first_chunk = chunk_video_list[0]
-                if os.path.exists(first_chunk) and os.access(first_chunk, os.R_OK):
-                    with open(first_chunk, 'rb') as f_chunk:
-                        shutil.copyfileobj(f_chunk, tmp_video)
-                else:
-                    logger(f"First Chunk missing for thumbnail: {first_chunk}")
-                    raise FileNotFoundError(f"First Chunk missing: {first_chunk}")
-            command = [
-                ffmpeg_path, '-y',
-                '-ss', '00:00:00.000',
-                '-i', temp_video_path,
-                '-vframes', '1',
-                '-q:v', '2',
-                output_thumbnail_path
-            ]
-            result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if result.returncode == 0 and os.path.exists(output_thumbnail_path):
-                if DEBUG: logger(f"Thumbnail extracted: {output_thumbnail_path}")
-                pass
+            if ok and thumb_path and os.path.exists(thumb_path):
+                self._fill_tile_with_thumb(label, thumb_path)
             else:
-                logger(f"FFMPEG Failed to extract thumbnail: {session_mpd_path}: {result.stderr}")
-                self.create_placeholder_thumbnail(output_thumbnail_path)
-        except Exception as exc:
-            logger(f"Error extracting thumbnail {session_mpd_path}: {exc}", exc_info=True)
-            self.create_placeholder_thumbnail(output_thumbnail_path)
-        finally:
-            if temp_video_path and os.path.exists(temp_video_path):
-                try:
-                    os.unlink(temp_video_path)
-                except OSError as exc:
-                    logger(f"Error removing thumbnail temp files: {temp_video_path}: {exc}")
+                label.setText("Missing\nThumbnail")
+        except RuntimeError:
+            pass  # underlying widget was deleted between scheduling and delivery
 
-    @staticmethod
-    def create_placeholder_thumbnail(output_path, width=320, height=180, text="Missing Thumbnail"):
-        try:
-            image = Image.new('RGB', (width, height), color='black')
-            draw = ImageDraw.Draw(image)
-            font = ImageFont.load_default()
-            bbox = draw.textbbox((0, 0), text, font=font)
-            text_width = bbox[2] - bbox[0]
-            text_height = bbox[3] - bbox[1]
-            x = (width - text_width) / 2
-            y = (height - text_height) / 2
-            draw.text((x, y), text, fill='white', font=font)
-            image.save(output_path, 'JPEG')
-            logger(f"Thumbnail placeholder created: {output_path}")
-        except Exception as exc:
-            logger(f"Error creating placeholder thumbnail {output_path}: {exc}")
+    def _start_cache_cleanup(self):
+        self.thumb_pool.start(_CacheCleanupWorker(self.thumbnail_cache))
 
     def get_clip_duration(self, clip_folder):
         total_seconds = 0.0
@@ -1307,22 +1523,27 @@ class SteamClipApp(QWidget):
         seconds = int(total_seconds % 60)
         return f"{minutes}:{seconds:02d}"
 
-    def add_thumbnail_to_grid(self, thumbnail_path, folder, index):
+    def _create_tile_container(self, folder, index, pixmap=None, loading_text=None):
         container = ThumbnailFrame()
         container.setFixedSize(340, 200)
         container_layout = QVBoxLayout()
         container.setLayout(container_layout)
-        pixmap = QPixmap(thumbnail_path).scaled(340, 200, Qt.AspectRatioMode.KeepAspectRatioByExpanding)
+        container_layout.setContentsMargins(0, 0, 0, 0)
         thumbnail_label = QLabel()
-        thumbnail_label.setPixmap(pixmap)
         thumbnail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        thumbnail_label.setStyleSheet("border: none; border-radius: 4px;")
-        thumbnail_label.setScaledContents(True)
+        if pixmap is not None:
+            thumbnail_label.setPixmap(pixmap)
+            thumbnail_label.setStyleSheet("border: none; border-radius: 4px;")
+            thumbnail_label.setScaledContents(True)
+        else:
+            thumbnail_label.setText(loading_text or "")
+            thumbnail_label.setStyleSheet(
+                "border: none; border-radius: 4px; color: #9aa6b2; font-size: 14px;"
+            )
         def select_clip_event(_event):
             self.select_clip(folder, container)
         thumbnail_label.mousePressEvent = select_clip_event
         container_layout.addWidget(thumbnail_label)
-        container_layout.setContentsMargins(0,0,0,0)
         duration = self.get_clip_duration(folder)
         duration_label = QLabel(f"{duration}", container)
         duration_label.setStyleSheet("""
@@ -1336,13 +1557,26 @@ class SteamClipApp(QWidget):
         duration_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom)
         duration_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         duration_label.adjustSize()
-        duration_width = duration_label.width()
-        duration_height = duration_label.height()
-        x = 340 - duration_width - 10
-        y = 200 - duration_height - 10
+        x = 340 - duration_label.width() - 10
+        y = 200 - duration_label.height() - 10
         duration_label.move(x, y)
         container.folder = folder
         self.clip_grid.addWidget(container, index // 3, index % 3)
+        return container, thumbnail_label
+
+    def add_thumbnail_to_grid(self, thumbnail_path, folder, index):
+        pixmap = QPixmap(thumbnail_path).scaled(340, 200, Qt.AspectRatioMode.KeepAspectRatioByExpanding)
+        self._create_tile_container(folder, index, pixmap=pixmap)
+
+    def add_loading_tile(self, folder, index):
+        return self._create_tile_container(folder, index, loading_text="Loading\u2026")
+
+    def _fill_tile_with_thumb(self, thumbnail_label, thumbnail_path):
+        pixmap = QPixmap(thumbnail_path).scaled(340, 200, Qt.AspectRatioMode.KeepAspectRatioByExpanding)
+        thumbnail_label.setText("")
+        thumbnail_label.setPixmap(pixmap)
+        thumbnail_label.setStyleSheet("border: none; border-radius: 4px;")
+        thumbnail_label.setScaledContents(True)
 
     def select_clip(self, folder, container):
         if folder in self.selected_clips:
