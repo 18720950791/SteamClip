@@ -3,6 +3,7 @@ import os
 import sys
 import subprocess
 import json
+import re
 from typing import Optional
 import webbrowser
 import imageio_ffmpeg as iio
@@ -27,7 +28,7 @@ from PyQt6.QtWidgets import (
     QFrame, QComboBox, QDialog, QTableWidget,
     QTableWidgetItem, QTextEdit, QMessageBox,
     QFileDialog, QLayout, QProgressBar, QHeaderView,
-    QGroupBox
+    QGroupBox, QInputDialog
 )
 from PyQt6.QtGui import QPixmap, QIcon, QDesktopServices, QColor, QGuiApplication
 from PyQt6.QtCore import Qt, QUrl, QThread, pyqtSignal
@@ -128,6 +129,104 @@ def handle_exception(exc_type, exc_value, exc_traceback):
         "A crash report has been saved to:\n"
         f"{log_file}")
 
+# ==================== CONVERSION PRESETS ====================
+DEFAULT_PRESET_LABEL = "Default (Stream Copy)"
+PRESET_CONTAINERS = ["mp4", "mkv", "mov", "webm"]
+PRESET_VIDEO_CODECS = ["copy", "h264", "hevc", "vp9"]
+PRESET_AUDIO_CODECS = ["copy", "aac", "mp3", "opus"]
+PRESET_QUALITIES = ["high", "medium", "low"]
+
+# Codecs each container can legally mux. None means "accepts effectively anything".
+CONTAINER_SUPPORT = {
+    "mp4":  {"video": {"h264", "hevc", "mpeg4", "av1"}, "audio": {"aac", "mp3", "ac3"}},
+    "mov":  {"video": {"h264", "hevc", "mpeg4", "prores"}, "audio": {"aac", "mp3", "pcm_s16le"}},
+    "mkv":  {"video": None, "audio": None},
+    "webm": {"video": {"vp8", "vp9", "av1"}, "audio": {"opus", "vorbis"}},
+}
+
+# Map preset codec choices to concrete ffmpeg encoders.
+VIDEO_ENCODER = {"h264": "libx264", "hevc": "libx265", "vp9": "libvpx-vp9"}
+AUDIO_ENCODER = {"aac": "aac", "mp3": "libmp3lame", "opus": "libopus"}
+
+# Per-encoder quality settings keyed by quality level.
+QUALITY_MAP = {
+    "libx264":    {"high": ["-crf", "18"], "medium": ["-crf", "23"], "low": ["-crf", "28"]},
+    "libx265":    {"high": ["-crf", "20"], "medium": ["-crf", "25"], "low": ["-crf", "30"]},
+    "libvpx-vp9": {"high": ["-crf", "24", "-b:v", "0"], "medium": ["-crf", "31", "-b:v", "0"], "low": ["-crf", "37", "-b:v", "0"]},
+    "aac":        {"high": ["-b:a", "192k"], "medium": ["-b:a", "128k"], "low": ["-b:a", "96k"]},
+    "libmp3lame": {"high": ["-q:a", "2"], "medium": ["-q:a", "4"], "low": ["-q:a", "6"]},
+    "libopus":    {"high": ["-b:a", "160k"], "medium": ["-b:a", "112k"], "low": ["-b:a", "80k"]},
+}
+
+
+def build_merge_command(ffmpeg_path, video_path, audio_path, output_file, preset):
+    """Build an ffmpeg merge command for a given preset (container/codecs/quality)."""
+    quality = preset.get("quality", "medium")
+    command = [ffmpeg_path, '-y', '-i', video_path, '-i', audio_path]
+    if preset.get("video_codec", "copy") == "copy":
+        command += ['-c:v', 'copy']
+    else:
+        encoder = VIDEO_ENCODER[preset["video_codec"]]
+        command += ['-c:v', encoder] + QUALITY_MAP.get(encoder, {}).get(quality, [])
+    if preset.get("audio_codec", "copy") == "copy":
+        command += ['-c:a', 'copy']
+    else:
+        encoder = AUDIO_ENCODER[preset["audio_codec"]]
+        command += ['-c:a', encoder] + QUALITY_MAP.get(encoder, {}).get(quality, [])
+    if preset.get("container") in ("mp4", "mov"):
+        command += ['-movflags', '+faststart']
+    command.append(output_file)
+    return command
+
+
+def probe_input_codecs(input_path):
+    """Return (video_codec, audio_codec) of an input by parsing 'ffmpeg -i' stderr.
+
+    imageio_ffmpeg ships ffmpeg but not ffprobe, so we read the stream summary
+    that ffmpeg prints to stderr. Returns (None, None) if detection fails.
+    """
+    ffmpeg_path = iio.get_ffmpeg_exe()
+    subprocess_args = {'stdout': subprocess.PIPE, 'stderr': subprocess.PIPE}
+    if IS_WINDOWS:
+        subprocess_args['creationflags'] = subprocess.CREATE_NO_WINDOW
+    try:
+        result = subprocess.run([ffmpeg_path, '-i', input_path], **subprocess_args)
+        stderr = result.stderr.decode('utf-8', errors='ignore')
+    except Exception as exc:
+        logger(f"Failed to probe input codecs for {input_path}: {exc}")
+        return None, None
+    video_match = re.search(r'Stream #\d+:\d+.*?Video:\s*([A-Za-z0-9_]+)', stderr)
+    audio_match = re.search(r'Stream #\d+:\d+.*?Audio:\s*([A-Za-z0-9_]+)', stderr)
+    video_codec = video_match.group(1) if video_match else None
+    audio_codec = audio_match.group(1) if audio_match else None
+    return video_codec, audio_codec
+
+
+def validate_preset(preset, input_video_codec, input_audio_codec):
+    """Check a preset against the input streams and target container.
+
+    Returns (ok, message). 'copy' resolves to the detected input codec.
+    Unknown input codecs (probe failed) are not treated as errors.
+    """
+    container = preset.get("container", "mp4")
+    support = CONTAINER_SUPPORT.get(container)
+    effective_video = input_video_codec if preset.get("video_codec") == "copy" else preset.get("video_codec")
+    effective_audio = input_audio_codec if preset.get("audio_codec") == "copy" else preset.get("audio_codec")
+    problems = []
+    if support:
+        if support["video"] is not None and effective_video and effective_video not in support["video"]:
+            problems.append(f"the '{container}' container cannot hold video codec '{effective_video}'")
+        if support["audio"] is not None and effective_audio and effective_audio not in support["audio"]:
+            problems.append(f"the '{container}' container cannot hold audio codec '{effective_audio}'")
+    if not problems:
+        return True, ""
+    message = "The selected conversion preset is not compatible with this clip:\n\n- " + "\n- ".join(problems)
+    if preset.get("video_codec") == "copy" or preset.get("audio_codec") == "copy":
+        message += ("\n\nTip: change the codec from 'copy' to a specific encoder, "
+                    "or choose a more permissive container such as 'mkv'.")
+    return False, message
+
+
 class ThumbnailFrame(QFrame):
     def __init__(self, parent=None):
         super(ThumbnailFrame, self).__init__(parent)
@@ -138,12 +237,13 @@ class ConversionThread(QThread):
     finished_signal = pyqtSignal(bool, str, bool)
     error_signal = pyqtSignal(str)
 
-    def __init__(self, clip_list, export_dir, game_ids, export_all=False):
+    def __init__(self, clip_list, export_dir, game_ids, export_all=False, preset=None):
         super().__init__()
         self.clip_list = clip_list
         self.export_dir = export_dir
         self.game_ids = game_ids
         self.export_all = export_all
+        self.preset = preset
         self._is_cancelled = False
 
     def cancel(self):
@@ -280,9 +380,12 @@ class ConversionThread(QThread):
         if IS_WINDOWS:
             subprocess_args['creationflags'] = subprocess.CREATE_NO_WINDOW
         logger(f"Merging to output file: {output_file}")
-        subprocess.run([
-            ffmpeg_path, '-i', video_path, '-i', audio_path, '-c', 'copy', output_file
-        ], **subprocess_args)
+        if self.preset is None:
+            command = [ffmpeg_path, '-i', video_path, '-i', audio_path, '-c', 'copy', output_file]
+        else:
+            command = build_merge_command(ffmpeg_path, video_path, audio_path, output_file, self.preset)
+        logger(f"Merge command: {' '.join(command)}")
+        subprocess.run(command, **subprocess_args)
         return output_file
 
     def generate_output_filename(self, clip_folder):
@@ -295,7 +398,8 @@ class ConversionThread(QThread):
             game_name = game_id
         sanitized_game_name = pathvalidate.sanitize_filename(game_name)
         base_filename_with_date = f"{sanitized_game_name}_{formatted_date}"
-        return self.get_unique_filename(self.export_dir, f"{base_filename_with_date}.mp4")
+        extension = self.preset["container"] if self.preset else "mp4"
+        return self.get_unique_filename(self.export_dir, f"{base_filename_with_date}.{extension}")
 
     def extract_date_from_folder_name(self, parts):
         if len(parts) >= 3:
@@ -358,6 +462,8 @@ class SteamClipApp(QWidget):
         self.settings_window = None
         self.conversion_thread = None
         self.current_theme = self.config.get('theme', 'Steam Dark')
+        self.presets = self.config.get('conversion_presets', {})
+        self.active_preset = self.config.get('active_preset', '')
 
         first_run = not os.path.exists(self.CONFIG_FILE)
         if not self.default_dir:
@@ -435,6 +541,8 @@ class SteamClipApp(QWidget):
         self.bottom_layout.addWidget(self.next_button)
         self.bottom_layout.addWidget(self.convert_button)
         self.bottom_layout.addWidget(self.exit_button)
+        self.conversion_group = self._build_conversion_group()
+        self.main_layout.addWidget(self.conversion_group)
         self.main_layout.addLayout(self.bottom_layout)
         self.setLayout(self.main_layout)
         self.main_layout.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
@@ -643,7 +751,9 @@ class SteamClipApp(QWidget):
         config = {
             'userdata_path': None,
             'export_path': os.path.normpath(os.path.join(os.path.expanduser("~"), "Desktop")),
-            'theme': 'Steam Dark'
+            'theme': 'Steam Dark',
+            'conversion_presets': {},
+            'active_preset': ''
         }
         if os.path.exists(self.CONFIG_FILE):
             logger("Loading configuration file...")
@@ -663,13 +773,22 @@ class SteamClipApp(QWidget):
                             config['export_path'] = os.path.normpath(value)
                         elif key == 'theme':
                             config['theme'] = value
+                        elif key == 'conversion_presets':
+                            try:
+                                config['conversion_presets'] = json.loads(value) if value else {}
+                            except (json.JSONDecodeError, ValueError):
+                                logger("Malformed conversion_presets in config; resetting to empty.")
+                                config['conversion_presets'] = {}
+                        elif key == 'active_preset':
+                            config['active_preset'] = value
                         else:
                             logger(f"Malformed config line skipped: {line}")
         else:
             logger("No config file found (Fresh Install or Deleted).")
         return config
 
-    def save_config(self, userdata_path=None, export_path=None, theme=None):
+    def save_config(self, userdata_path=None, export_path=None, theme=None,
+                    conversion_presets=None, active_preset=None):
             logger(f"Saving configuration. Userdata: {userdata_path}, Export: {export_path}, Theme: {theme}")
 
             if userdata_path is not None:
@@ -678,10 +797,18 @@ class SteamClipApp(QWidget):
                 self.config['export_path'] = os.path.normpath(export_path)
             if theme is not None:
                 self.config['theme'] = theme
+            if conversion_presets is not None:
+                self.config['conversion_presets'] = conversion_presets
+            if active_preset is not None:
+                self.config['active_preset'] = active_preset
 
             with open(self.CONFIG_FILE, 'w') as f:
                 for key, value in self.config.items():
-                    if value is not None:
+                    if value is None:
+                        continue
+                    if key == 'conversion_presets':
+                        f.write(f"{key}={json.dumps(value, ensure_ascii=False)}\n")
+                    else:
                         f.write(f"{key}={value}\n")
 
     def moveEvent(self, event):
@@ -1396,6 +1523,135 @@ class SteamClipApp(QWidget):
         self.gameid_combo.setEnabled(enabled)
         self.media_type_combo.setEnabled(enabled)
         self.settings_button.setEnabled(enabled)
+        for widget in (self.preset_combo, self.container_combo, self.vcodec_combo,
+                       self.acodec_combo, self.quality_combo,
+                       self.save_preset_button, self.delete_preset_button):
+            widget.setEnabled(enabled)
+
+    def _build_conversion_group(self):
+        group = QGroupBox("Conversion")
+        layout = QHBoxLayout()
+
+        self.preset_combo = QComboBox()
+        self.preset_combo.setMinimumWidth(170)
+        self.container_combo = QComboBox()
+        self.container_combo.addItems(PRESET_CONTAINERS)
+        self.vcodec_combo = QComboBox()
+        self.vcodec_combo.addItems(PRESET_VIDEO_CODECS)
+        self.acodec_combo = QComboBox()
+        self.acodec_combo.addItems(PRESET_AUDIO_CODECS)
+        self.quality_combo = QComboBox()
+        self.quality_combo.addItems(PRESET_QUALITIES)
+
+        self.save_preset_button = self.create_button("Save Preset", self.save_preset, size=(110, 35))
+        self.delete_preset_button = self.create_button("Delete", self.delete_preset, size=(80, 35))
+
+        layout.addWidget(QLabel("Preset:"))
+        layout.addWidget(self.preset_combo)
+        layout.addWidget(QLabel("Container:"))
+        layout.addWidget(self.container_combo)
+        layout.addWidget(QLabel("Video:"))
+        layout.addWidget(self.vcodec_combo)
+        layout.addWidget(QLabel("Audio:"))
+        layout.addWidget(self.acodec_combo)
+        layout.addWidget(QLabel("Quality:"))
+        layout.addWidget(self.quality_combo)
+        layout.addStretch()
+        layout.addWidget(self.save_preset_button)
+        layout.addWidget(self.delete_preset_button)
+
+        group.setLayout(layout)
+        self.refresh_preset_combo()
+        self._load_combos_from_selection()
+        self.preset_combo.currentIndexChanged.connect(self.on_preset_selected)
+        return group
+
+    def refresh_preset_combo(self):
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        self.preset_combo.addItem(DEFAULT_PRESET_LABEL)
+        for name in sorted(self.presets.keys()):
+            self.preset_combo.addItem(name)
+        index = self.preset_combo.findText(self.active_preset) if self.active_preset else 0
+        self.preset_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.preset_combo.blockSignals(False)
+
+    def _load_combos_from_selection(self):
+        name = self.preset_combo.currentText()
+        preset = self.presets.get(name) if name != DEFAULT_PRESET_LABEL else None
+        if not preset:
+            preset = {"container": "mp4", "video_codec": "copy", "audio_codec": "copy", "quality": "medium"}
+        self.container_combo.setCurrentText(preset.get("container", "mp4"))
+        self.vcodec_combo.setCurrentText(preset.get("video_codec", "copy"))
+        self.acodec_combo.setCurrentText(preset.get("audio_codec", "copy"))
+        self.quality_combo.setCurrentText(preset.get("quality", "medium"))
+
+    def on_preset_selected(self, _index=0):
+        name = self.preset_combo.currentText()
+        self.active_preset = '' if name == DEFAULT_PRESET_LABEL else name
+        self._load_combos_from_selection()
+        self.save_config(active_preset=self.active_preset)
+
+    def current_preset(self):
+        container = self.container_combo.currentText()
+        video_codec = self.vcodec_combo.currentText()
+        audio_codec = self.acodec_combo.currentText()
+        quality = self.quality_combo.currentText()
+        # copy/copy into mp4 is exactly the legacy default -> keep original behavior.
+        if container == "mp4" and video_codec == "copy" and audio_codec == "copy":
+            return None
+        return {
+            "container": container,
+            "video_codec": video_codec,
+            "audio_codec": audio_codec,
+            "quality": quality,
+        }
+
+    def save_preset(self):
+        preset = {
+            "container": self.container_combo.currentText(),
+            "video_codec": self.vcodec_combo.currentText(),
+            "audio_codec": self.acodec_combo.currentText(),
+            "quality": self.quality_combo.currentText(),
+        }
+        suggested = self.preset_combo.currentText()
+        if suggested == DEFAULT_PRESET_LABEL:
+            suggested = ""
+        name, ok = QInputDialog.getText(self, "Save Preset", "Preset name:", text=suggested)
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            self.show_error("Preset name cannot be empty.")
+            return
+        if name == DEFAULT_PRESET_LABEL:
+            self.show_error("That name is reserved. Please choose another.")
+            return
+        self.presets[name] = preset
+        self.active_preset = name
+        self.save_config(conversion_presets=self.presets, active_preset=self.active_preset)
+        self.refresh_preset_combo()
+        logger(f"Saved conversion preset '{name}': {preset}")
+        self.show_info(f"Preset '{name}' saved.")
+
+    def delete_preset(self):
+        name = self.preset_combo.currentText()
+        if name == DEFAULT_PRESET_LABEL or name not in self.presets:
+            self.show_error("Select a saved preset to delete.")
+            return
+        reply = QMessageBox.question(
+            self, "Delete Preset", f"Delete preset '{name}'?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        del self.presets[name]
+        self.active_preset = ''
+        self.save_config(conversion_presets=self.presets, active_preset=self.active_preset)
+        self.refresh_preset_combo()
+        self._load_combos_from_selection()
+        logger(f"Deleted conversion preset '{name}'")
 
     def process_clips(self, selected_clips=None, export_all=False):
         logger(f"Initiating process_clips. ExportAll: {export_all}")
@@ -1406,6 +1662,17 @@ class SteamClipApp(QWidget):
             logger("Process cancelled: No clips to process.")
             self.show_error("No clips to process")
             return False
+        preset = self.current_preset()
+        if preset is not None:
+            input_video_codec, input_audio_codec = None, None
+            session_files = self.find_session_mpd(clip_list[0])
+            if session_files:
+                input_video_codec, input_audio_codec = probe_input_codecs(session_files[0])
+            ok, message = validate_preset(preset, input_video_codec, input_audio_codec)
+            if not ok:
+                logger(f"Preset incompatible with input: {message}")
+                QMessageBox.warning(self, "Incompatible Conversion Settings", message)
+                return False
         self.progress_bar.setValue(0)
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 100)
@@ -1415,7 +1682,8 @@ class SteamClipApp(QWidget):
             clip_list,
             self.export_dir,
             self.game_ids,
-            export_all
+            export_all,
+            preset
         )
         self.conversion_thread.progress_update.connect(self.on_progress_update)
         self.conversion_thread.finished_signal.connect(self.on_conversion_finished)
